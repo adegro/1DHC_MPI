@@ -2,10 +2,17 @@
 program fdhc
 
   include 'mpif.h'
-  implicit none
-
-  integer :: rank, size, np, ierr
-  character :: errstr(MPI_MAX_ERROR_STRING)
+  include 'mpif-ext.h'
+!  implicit none
+  
+  integer :: rank, size, np, ierr, errstr(MPI_MAX_ERROR_STRING)
+  integer :: i, fsdo, j, nx, nt, fn, npp
+  integer :: stat(MPI_STATUS_SIZE), tag
+  real*8 :: ro, cp, k, t0, tn, x0, xn, h,  dt, fac1, fac2, safe
+  real*8 :: dtlast, time, pos, temp1, temp2, source, sfact, rn
+  real*8,dimension(:),allocatable :: T, F, S, rhs
+  character(LEN=3) :: tinteg
+!  character :: errstr(MPI_MAX_ERROR_STRING)
 
   !
   !Initialize MPI
@@ -16,30 +23,6 @@ program fdhc
   call MPI_Comm_set_errhandler(MPI_COMM_WORLD,MPI_ERRORS_RETURN, ierr)
 
   np = size
-  call htc (rank,np)
-  
-
-end program fdhc
-!
-!------------------------------------------------------------------
-!******************************************************************
-!------------------------------------------------------------------
-!Functions and subroutines
-!------------------------------------------------------------------
-!******************************************************************
-!------------------------------------------------------------------
-subroutine htc(rank,np)
-  !subroutine to solve heat conduction equation using FD
-  !--------------------------------------------------
-  implicit none
-
-  integer :: i, fsdo, j, nx, nt, fn, npp
-  integer :: rank, np
-  real*8 :: ro, cp, k, t0, tn, x0, xn, h,  dt, fac1, fac2, safe
-  real*8 :: dtlast, time, pos, temp1, temp2, source, sfact
-  real*8,dimension(:),allocatable :: T, F, S, rhs
-  character(LEN=3) :: tinteg
-  character :: errstr(MPI_MAX_ERROR_STRING)
 
   !     read input parameters
   call inpar(x0,xn,h,t0,tn,temp1,temp2, &
@@ -65,7 +48,7 @@ subroutine htc(rank,np)
   !Determining the time step with safety factor
   dt = (h*h/2)*safe
 
-  !Number of time steps and last time step size
+  !Number of time steps
   nt = floor((tn-t0)/dt)
 
   !Applying BC
@@ -89,18 +72,23 @@ subroutine htc(rank,np)
   time = 0
 
   do j = 1,nt
+  !do j=1,3
 
      time = time + dt
 
      !!
-     !!Exchange information between domains
+     !!Exchange information between domains if size>1
      !!
      !
      !Send T[1],T[2] to rank-1
      !
-     if (rank > 0 && rank < np) then
+     if (size == 1) then
+        goto 1000
+     end if
+     
+     if (rank > 0 .and. rank < np) then
         tag = 1
-        call MPI_Send (T[3], 2, MPI_DOUBLE, rank-1, tag, MPI_COMM_WORLD,ierr)
+        call MPI_Send (T(3), 2, MPI_DOUBLE, rank-1, tag, MPI_COMM_WORLD, ierr)
      end if
      
      !
@@ -108,35 +96,41 @@ subroutine htc(rank,np)
      !
      if (rank < np-1) then
         tag = 1
-        call MPI_Recv (T[npp+3], 2, MPI_DOUBLE, rank+1, tag, MPI_COMM_WORLD, &status,ierr)
+        call MPI_Recv (T(npp+3), 2, MPI_DOUBLE, rank+1, tag, MPI_COMM_WORLD, stat, ierr)
      end if
      
      !Send T[npp-1],T[npp] to rank+1
      !
      if (rank < np-1) then
         tag = 1
-        call MPI_Send (T[npp+1], 2, MPI_DOUBLE, rank+1, tag, MPI_COMM_WORLD,ierr)
+        call MPI_Send (T(npp+1), 2, MPI_DOUBLE, rank+1, tag, MPI_COMM_WORLD, ierr)
      end if
 
      !
      !Receive T[-2],T[-1] from rank-1
      !
-     if (rank > 0 && rank < np) then
+     if (rank > 0 .and. rank < np) then
         tag = 1
-        call MPI_Recv (T[1], 2, MPI_DOUBLE, rank-1, tag, MPI_COMM_WORLD, &status,ierr)
+        call MPI_Recv (T(1), 2, MPI_DOUBLE, rank-1, tag, MPI_COMM_WORLD, stat, ierr)
      end if
+
+     1000 continue
      
      !
      !Calculating fluxes
      !
      do i = 2,npp+2
+     !do i = 2,8
         call flux_4tho(F(i-1),T(i+1),T(i),T(i-1),T(i+2),fac1,fac2)
+      !  write(6,*) F(i-1),T(i+1),T(i),T(i-1),T(i+2),fac1,fac2
      end do
 
      !Calculating source
+     rn=rank*npp
      do i = 2,npp+1
-        pos = x0+(i-2.0d+00)*h
+        pos = x0+((i-2.0d+00)+rn)*h
         S(i-1) = source(pos,time,sfact)
+        !S(i-1) = 0.1
      end do
 
      !Calculating RHS
@@ -151,12 +145,20 @@ subroutine htc(rank,np)
 
      !Write out results
      fn=100000*rank+j
-     call output(time,T,nx,fn,tinteg,fsdo,h)
+     call output(time,T,npp,fn,fsdo,h,rn)
 
   end do
-
+end program fdhc
+!
+!------------------------------------------------------------------
+!******************************************************************
+!------------------------------------------------------------------
+!Functions and subroutines
+!------------------------------------------------------------------
+!******************************************************************
+!------------------------------------------------------------------
   !------------------------------------------------------------------
-  double precision function source(x,t,sfact)
+  real*8 function source(x,t,sfact)
     real*8 :: x,t,sfact
     source = sfact*exp(-(x-t)*(x-t))
     return
@@ -168,19 +170,14 @@ subroutine htc(rank,np)
     return
   end subroutine flux_4tho
   !------------------------------------------------------------------
-  subroutine output(time,T,size,fn,tinteg,fsdo,h)
+  subroutine output(time,T,size,fn,fsdo,h,rn)
     integer :: fn,fsdo,size
-    real*8 :: time,h
+    real*8 :: time,h,rn
     real*8, dimension(size+2) :: T
-    character(LEN=20) :: fname
-    character(LEN=3) :: tinteg
+    character(LEN=10) :: fname
 
     !file name
-    if (fsdo==2) then
-       write(fname,200) '2nd_',tinteg,fn,'.out'
-    else
-       write(fname,200) '4th_',tinteg,fn,'.out'
-    end if
+    write(fname,200) fn,'.out'
 
     !file number
     fn = 10000+fn
@@ -189,13 +186,13 @@ subroutine htc(rank,np)
     open(unit = fn, file = fname)
 
     do i=2,size+1
-       write(fn,100) (i-2)*h,T(i)
+       write(fn,100) (i-2+rn)*h,T(i)
     end do
 
     close(fn)
 
 100 format(2f9.4)
-200 format(2a,i0.6,a)
+200 format(i0.6,a)
   end subroutine output
   !------------------------------------------------------------------
   !------------------------------------------------------------------
