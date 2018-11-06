@@ -1,0 +1,10 @@
+3
+***************************************************
+heat transfer solver with a source input parameters
+***************************************************
+ x0     xn     h   t0     tn  temp1 temp2
+0.0  100.0   0.1  0.0    3.0    0.0   0.0
+ ro   cp    k safe sfact fout  dtmax
+1.0  1.0  1.0  0.7  1.0  1.0    1.0
+fsdo tinteg
+   4    h00
