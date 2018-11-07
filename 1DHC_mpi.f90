@@ -12,7 +12,7 @@ program fdhc
   real*8 :: dtlast, time, pos, temp1, temp2, source, sfact, rn
   real*8,dimension(:),allocatable :: T, F, S, rhs
   character(LEN=3) :: tinteg
-!  character :: errstr(MPI_MAX_ERROR_STRING)
+  integer :: errh
 
   !
   !Initialize MPI
@@ -20,6 +20,7 @@ program fdhc
   call MPI_INIT (ierr)
   call MPI_Comm_rank(MPI_COMM_WORLD, rank, ierr)
   call MPI_Comm_size(MPI_COMM_WORLD, size,  ierr)
+  call MPI_Comm_create_errhandler(verbose_errhandler, &errh, ierr);
   call MPI_Comm_set_errhandler(MPI_COMM_WORLD,MPI_ERRORS_RETURN, ierr)
 
   np = size
