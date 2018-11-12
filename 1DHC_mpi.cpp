@@ -4,11 +4,18 @@
 # include <fstream>
 # include <iostream>
 # include <mpi.h>
+# include <mpi-ext.h>
+# include <signal.h>
 
 using namespace std;
 
 int main ( int argc, char *argv[] );
 void htc ( int rank, int np );
+static void verbose_errhandler(MPI_Comm* pcomm, int* perr, ...);
+static int MPIX_Comm_replace(MPI_Comm comm, MPI_Comm *newcomm);
+static int app_buddy_ckpt(MPI_Comm comm);
+static int app_reload_ckpt(MPI_Comm comm);
+static int app_needs_repair(void);
 
 //****************************************************************************
 
@@ -18,7 +25,7 @@ int main ( int argc, char *argv[] )
 {
   int rank;
   int size, np;
-  char errstr[MPI_MAX_ERROR_STRING];
+  MPI_Errhandler errh;
 
 //
 //  Initialize MPI.
@@ -27,8 +34,10 @@ int main ( int argc, char *argv[] )
   MPI_Init ( &argc, &argv );
   MPI_Comm_rank ( MPI_COMM_WORLD, &rank );
   MPI_Comm_size ( MPI_COMM_WORLD, &size );
+  MPI_Comm_create_errhandler(verbose_errhandler,
+                               &errh);
   MPI_Comm_set_errhandler(MPI_COMM_WORLD,
-                            MPI_ERRORS_RETURN);
+                            errh);
 
   np = size;
   htc ( rank, np );
@@ -126,6 +135,19 @@ void htc ( int rank, int np )
         {
             time = time + dt;
 
+	    if (j == 50)
+	      {
+
+		MPI_Barrier(MPI_COMM_WORLD);
+		if( rank == (np-1)||rank == (np/2) )
+		  {
+		    printf("Rank %d / %d: bye bye!\n", rank, np);
+		    raise(SIGKILL);
+		  }
+
+		MPI_Barrier(MPI_COMM_WORLD);
+		printf("Rank %d / %d: Stayin' alive!\n", rank, np);
+              }
 	    //
 	    // Send T[1],T[2] to rank-1
 	    //	    
@@ -211,9 +233,7 @@ void htc ( int rank, int np )
 	    //Output results
 	    MPI_Barrier(MPI_COMM_WORLD);
 	    char fname[10];
-	    //fname << 100000*rank+j <<".txt";
-	    sprintf(fname,"%d",100000*rank+j);
-	    //cout << fname << "\n";
+	    sprintf(fname,"%d.%s",100000*(rank+1)+j,"txt");
 	    t_file.open (fname);
 	    for (int i=2; i<npp+2; i++)
 	      {
@@ -225,3 +245,71 @@ void htc ( int rank, int np )
 
   return;
 }
+
+//****************************************************************************
+
+static void verbose_errhandler(MPI_Comm* pcomm, int* perr, ...) {
+
+//****************************************************************************
+    MPI_Comm comm = *pcomm;
+    int err = *perr;
+    char errstr[MPI_MAX_ERROR_STRING];
+    int i, rank, size, nf, len, eclass;
+    MPI_Group group_c, group_f;
+    int *ranks_gc, *ranks_gf;
+
+    MPI_Error_class(err, &eclass);
+    if( MPIX_ERR_PROC_FAILED != eclass ) {
+        MPI_Abort(comm, err);
+    }
+
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    /* We use a combination of 'ack/get_acked' to obtain the list of 
+     * failed processes (as seen by the local rank). 
+     */
+    MPIX_Comm_failure_ack(comm);
+    MPIX_Comm_failure_get_acked(comm, &group_f);
+    MPI_Group_size(group_f, &nf);
+    MPI_Error_string(err, errstr, &len);
+    printf("Rank %d / %d: Notified of error %s. %d found dead: { ",
+           rank, size, errstr, nf);
+
+    /* We use 'translate_ranks' to obtain the ranks of failed procs 
+     * in the input communicator 'comm'.
+     */
+    ranks_gf = (int*)malloc(nf * sizeof(int));
+    ranks_gc = (int*)malloc(nf * sizeof(int));
+    MPI_Comm_group(comm, &group_c);
+    for(i = 0; i < nf; i++)
+        ranks_gf[i] = i;
+    MPI_Group_translate_ranks(group_f, nf, ranks_gf,
+                              group_c, ranks_gc);
+    for(i = 0; i < nf; i++)
+        printf("%d ", ranks_gc[i]);
+    printf("}\n");
+    free(ranks_gf); free(ranks_gc);
+}
+//
+/* Buddy checkpointing */
+//
+static int app_buddy_ckpt(MPI_Comm comm) {
+    if(0 == rank || verbose) fprintf(stderr, "Rank %04d: checkpointing to %04d after iteration %d\n", rank, rbuddy(rank), iteration);
+    /* Store my checkpoint on my "right" neighbor */
+    MPI_Sendrecv(mydata_array, count, MPI_DOUBLE, rbuddy(rank), ckpt_tag,
+                 buddy_ckpt,   count, MPI_DOUBLE, lbuddy(rank), ckpt_tag,
+                 comm, MPI_STATUS_IGNORE);
+    /* Commit the local changes to the checkpoints only if successful. */
+    if(app_needs_repair()) {
+        fprintf(stderr, "Rank %04d: checkpoint commit was not succesful, rollback instead\n", rank);
+        longjmp(restart, 0);
+    }
+    ckpt_iteration = iteration;
+    /* Memcopy my own memory in my local checkpoint (with datatypes) */
+    MPI_Sendrecv(mydata_array, count, MPI_DOUBLE, 0, ckpt_tag,
+                 my_ckpt, count, MPI_DOUBLE, 0, ckpt_tag,
+                 MPI_COMM_SELF, MPI_STATUS_IGNORE);
+    return MPI_SUCCESS;
+}
+
