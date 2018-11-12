@@ -1,3 +1,7 @@
+/*
+--1D heat conduction 
+--FT using ULMF
+ */
 # include <cmath>
 # include <cstdlib>
 # include <ctime>
@@ -6,6 +10,7 @@
 # include <mpi.h>
 # include <mpi-ext.h>
 # include <signal.h>
+# include <setjmp.h>
 
 using namespace std;
 
@@ -16,6 +21,14 @@ static int MPIX_Comm_replace(MPI_Comm comm, MPI_Comm *newcomm);
 static int app_buddy_ckpt(MPI_Comm comm);
 static int app_reload_ckpt(MPI_Comm comm);
 static int app_needs_repair(void);
+static int iteration = 0;
+static int ckpt_iteration = -1;
+static const int ckpt_tag = 42;
+static jmp_buf restart;
+#define lbuddy(r) ((r+np-1)%np)
+#define rbuddy(r) ((r+np+1)%np)
+
+static MPI_Comm world = MPI_COMM_NULL;
 
 //****************************************************************************
 
@@ -25,21 +38,36 @@ int main ( int argc, char *argv[] )
 {
   int rank;
   int size, np;
+  int victim;
   MPI_Errhandler errh;
+  MPI_COMM parent;
 
 //
 //  Initialize MPI.
 //
 
   MPI_Init ( &argc, &argv );
-  MPI_Comm_rank ( MPI_COMM_WORLD, &rank );
-  MPI_Comm_size ( MPI_COMM_WORLD, &size );
-  MPI_Comm_create_errhandler(verbose_errhandler,
-                               &errh);
-  MPI_Comm_set_errhandler(MPI_COMM_WORLD,
-                            errh);
+  MPI_Comm_create_errhandler(&errhandler_respawn, &errh);
 
-  np = size;
+    /* 1st time or repair? */
+  MPI_Comm_get_parent( &parent );
+  if( MPI_COMM_NULL == parent )
+    {
+        /* First run: Let's create an initial world,
+         * a copy of MPI_COMM_WORLD */
+        MPI_Comm_dup( MPI_COMM_WORLD, &world );
+        MPI_Comm_size( world, &np );
+        MPI_Comm_rank( world, &rank );
+    }
+
+  else
+    {
+        /* repair, lets get the repaired world */
+        app_needs_repair();
+    }
+  /* We set an errhandler on world, so that a failure is not fatal anymore. */
+  MPI_Comm_set_errhandler( world, errh );
+    
   htc ( rank, np );
   
 //
@@ -57,9 +85,9 @@ void htc ( int rank, int np )
 {
   int i, fsdo, j, nx, nt, fn, tag, npp;
   double ro, cp, k, t0, tn, x0, xn, h,  dt, fac1, fac2, safe, dtmax;
-  double dtlast, time, pos, temp1, temp2, source, sfact, fout, tr;
+  double dtlast, time, pos, temp1, temp2, source, sfact, fout, tr, Tsize;
   ofstream t_file;
-  double *T;
+  double *T, *my_chp, *buddy_chp;
   double *F;
   double *S;
   double *rhs;
@@ -86,15 +114,18 @@ void htc ( int rank, int np )
     //number of points per process
     //must devide exactly 
     npp = nx/np;
+    Tsize = npp+4;
 
     //declare arrays
-    T = new double [npp+4];
+    T = new double [Tsize];
+    my_chp = new double [Tsize];
+    buddy_chp = new double [Tsize];
     F = new double [npp+1];
     S = new double [npp];
     rhs = new double [npp];
 
     //initialize arrays
-    for (int i=0; i<npp+4; i++)
+    for (int i=0; i<Tsize; i++)
         {
             T[i]=0.0;
         }
@@ -130,24 +161,24 @@ void htc ( int rank, int np )
     // Loop over time
     //
     time = 0.0;
-    for ( int j=1; j<nt; j=j+1)
+    setjmp(restart);
+    while (iteration < nt)
+    //for ( int j=1; j<nt; j=j+1)
       //for ( int j=1; j<3; j=j+1)
         {
             time = time + dt;
-
-	    if (j == 50)
+	    //checkpointing every 5 iterations
+	    if (0==iteration%5)
 	      {
+		app_buddy_ckpt(world);
+	      }
 
-		MPI_Barrier(MPI_COMM_WORLD);
-		if( rank == (np-1)||rank == (np/2) )
-		  {
-		    printf("Rank %d / %d: bye bye!\n", rank, np);
-		    raise(SIGKILL);
-		  }
-
-		MPI_Barrier(MPI_COMM_WORLD);
-		printf("Rank %d / %d: Stayin' alive!\n", rank, np);
+	    if (0==iteration%51 || rank==np/2)
+	      {
+		printf("Rank %04d: committing suicide at iteration %d\n", rank, iteration);
+		raise(SIGKILL);
               }
+		MPI_Barrier(MPI_COMM_WORLD);
 	    //
 	    // Send T[1],T[2] to rank-1
 	    //	    
@@ -248,57 +279,17 @@ void htc ( int rank, int np )
 
 //****************************************************************************
 
-static void verbose_errhandler(MPI_Comm* pcomm, int* perr, ...) {
+// Functions for the FT functionality
 
 //****************************************************************************
-    MPI_Comm comm = *pcomm;
-    int err = *perr;
-    char errstr[MPI_MAX_ERROR_STRING];
-    int i, rank, size, nf, len, eclass;
-    MPI_Group group_c, group_f;
-    int *ranks_gc, *ranks_gf;
-
-    MPI_Error_class(err, &eclass);
-    if( MPIX_ERR_PROC_FAILED != eclass ) {
-        MPI_Abort(comm, err);
-    }
-
-    MPI_Comm_rank(comm, &rank);
-    MPI_Comm_size(comm, &size);
-
-    /* We use a combination of 'ack/get_acked' to obtain the list of 
-     * failed processes (as seen by the local rank). 
-     */
-    MPIX_Comm_failure_ack(comm);
-    MPIX_Comm_failure_get_acked(comm, &group_f);
-    MPI_Group_size(group_f, &nf);
-    MPI_Error_string(err, errstr, &len);
-    printf("Rank %d / %d: Notified of error %s. %d found dead: { ",
-           rank, size, errstr, nf);
-
-    /* We use 'translate_ranks' to obtain the ranks of failed procs 
-     * in the input communicator 'comm'.
-     */
-    ranks_gf = (int*)malloc(nf * sizeof(int));
-    ranks_gc = (int*)malloc(nf * sizeof(int));
-    MPI_Comm_group(comm, &group_c);
-    for(i = 0; i < nf; i++)
-        ranks_gf[i] = i;
-    MPI_Group_translate_ranks(group_f, nf, ranks_gf,
-                              group_c, ranks_gc);
-    for(i = 0; i < nf; i++)
-        printf("%d ", ranks_gc[i]);
-    printf("}\n");
-    free(ranks_gf); free(ranks_gc);
-}
 //
 /* Buddy checkpointing */
 //
 static int app_buddy_ckpt(MPI_Comm comm) {
-    if(0 == rank || verbose) fprintf(stderr, "Rank %04d: checkpointing to %04d after iteration %d\n", rank, rbuddy(rank), iteration);
+    if(0 == rank ) fprintf(stderr, "Rank %04d: checkpointing to %04d after iteration %d\n", rank, rbuddy(rank), iteration);
     /* Store my checkpoint on my "right" neighbor */
-    MPI_Sendrecv(mydata_array, count, MPI_DOUBLE, rbuddy(rank), ckpt_tag,
-                 buddy_ckpt,   count, MPI_DOUBLE, lbuddy(rank), ckpt_tag,
+    MPI_Sendrecv(T, Tsize, MPI_DOUBLE, rbuddy(rank), ckpt_tag,
+                 buddy_chp, Tsize, MPI_DOUBLE, lbuddy(rank), ckpt_tag,
                  comm, MPI_STATUS_IGNORE);
     /* Commit the local changes to the checkpoints only if successful. */
     if(app_needs_repair()) {
@@ -307,9 +298,207 @@ static int app_buddy_ckpt(MPI_Comm comm) {
     }
     ckpt_iteration = iteration;
     /* Memcopy my own memory in my local checkpoint (with datatypes) */
-    MPI_Sendrecv(mydata_array, count, MPI_DOUBLE, 0, ckpt_tag,
-                 my_ckpt, count, MPI_DOUBLE, 0, ckpt_tag,
+    MPI_Sendrecv(T, Tsize, MPI_DOUBLE, 0, ckpt_tag,
+                 my_chp, Tsize, MPI_DOUBLE, 0, ckpt_tag,
                  MPI_COMM_SELF, MPI_STATUS_IGNORE);
     return MPI_SUCCESS;
 }
+//
+/* mockup checkpoint restart: we reset iteration, and we prevent further
+ * error injection */
+//
+static int app_reload_ckpt(MPI_Comm comm) {
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &np);
 
+    /* send my ckpt_iteration to my buddy to decide if we need to exchange a
+     * checkpoint
+     *   If ckpt_iteration is -1, I am restarting.
+     *   It iteration is -1, then my buddy is restarting.
+     *   Note: if an error occurs now, it will be absorbed by the error handler
+     *   and the restart will be repeated.
+     */
+    MPI_Sendrecv(&ckpt_iteration, 1, MPI_INT, rbuddy(rank), ckpt_tag,
+                 &iteration, 1, MPI_INT, lbuddy(rank), ckpt_tag,
+                 comm, MPI_STATUS_IGNORE);
+
+    if( -1 == iteration && -1 == ckpt_iteration ) {
+        fprintf(stderr, "Buddy checkpointing cannot restart from this failures because both me and my buddy have lost our checkpoints...\n");
+        MPI_Abort(comm, -1);
+    }
+
+    if( -1 == iteration ) {
+        fprintf(stderr, "Rank %04d: sending checkpoint to %04d at iteration %d\n", rank, lbuddy(rank), ckpt_iteration);
+        /* My buddy was dead, send the checkpoint */
+        MPI_Send(buddy_chp, Tsize, MPI_DOUBLE, lbuddy(rank), ckpt_tag, comm);
+    }
+    if( -1 == ckpt_iteration ) {
+        /* I replace a dead, get the ckeckpoint */
+        fprintf(stderr, "Rank %04d: restarting from %04d at iteration %d\n", rank, rbuddy(rank), iteration);
+        MPI_Recv(T, Tsize, MPI_DOUBLE, rbuddy(rank), ckpt_tag, comm, MPI_STATUS_IGNORE);
+        /* iteration has already been set by the sendrecv above */
+    }
+    else {
+        /* I am a survivor,
+         * Memcopy my own checkpoint back in my memory */
+        MPI_Sendrecv(my_chp, Tsize, MPI_DOUBLE, 0, ckpt_tag,
+                     T, Tsize, MPI_DOUBLE, 0, ckpt_tag,
+                     MPI_COMM_SELF, MPI_STATUS_IGNORE);
+        /* Reset iteration */
+        iteration = ckpt_iteration;
+    }
+    return 0;
+}
+
+/* repair comm world, reload checkpoints, etc...
+ *  Return: true: the app needs to redo some iterations
+ *          false: no failure was fixed, we do not need to redo any work.
+ */
+static int app_needs_repair(void) {
+    MPI_Comm tmp;
+    MPIX_Comm_replace(world, &tmp);
+    if( tmp == world ) return false;
+    if( MPI_COMM_NULL != world) MPI_Comm_free(&world);
+    world = tmp;
+    app_reload_ckpt(world);
+    /* Report that world has changed and we need to re-execute */
+    return true;
+}
+
+/* Do all the magic in the error handler */
+static void errhandler_respawn(MPI_Comm* pcomm, int* errcode, ...) {
+    int eclass;
+    MPI_Error_class(*errcode, &eclass);
+    MPI_Error_string(*errcode, estr, &strl);
+
+    if( MPIX_ERR_PROC_FAILED != eclass &&
+        MPIX_ERR_REVOKED != eclass ) {
+        fprintf(stderr, "%04d: errhandler invoked with unknown error %s\n", rank, estr);
+        raise(SIGSEGV);
+        MPI_Abort(MPI_COMM_WORLD, *errcode);
+    }
+    
+    fprintf(stderr, "%04d: errhandler invoked with error %s\n", rank, estr);
+    
+    MPIX_Comm_revoke(*pcomm);
+    if(app_needs_repair()) longjmp(restart, 0);
+}
+
+
+static int MPIX_Comm_replace(MPI_Comm comm, MPI_Comm *newcomm) {
+    MPI_Comm icomm, /* the intercomm between the spawnees and the old (shrinked) world */
+             scomm, /* the local comm for each sides of icomm */
+             mcomm; /* the intracomm, merged from icomm */
+    MPI_Group cgrp, sgrp, dgrp;
+    int rc, flag, rflag, i, nc, ns, nd, crank, srank, drank;
+
+redo:
+    if( comm == MPI_COMM_NULL ) { /* am I a new process? */
+        /* I am a new spawnee, waiting for my new rank assignment
+         * it will be sent by rank 0 in the old world */
+        MPI_Comm_get_parent(&icomm);
+        scomm = MPI_COMM_WORLD;
+        MPI_Recv(&crank, 1, MPI_INT, 0, 1, icomm, MPI_STATUS_IGNORE);
+        if( verbose ) {
+            MPI_Comm_rank(scomm, &srank);
+            fprintf(stderr, "Spawnee %d: crank=%d\n", srank, crank);
+        }
+    }
+    else {
+        /* I am a survivor: Spawn the appropriate number
+         * of replacement processes (we check that this operation worked
+         * before we procees further) */
+        /* First: remove dead processes */
+        MPIX_Comm_shrink(comm, &scomm);
+        MPI_Comm_size(scomm, &ns);
+        MPI_Comm_size(comm, &nc);
+        nd = nc-ns; /* number of deads */
+        if( 0 == nd ) {
+            /* Nobody was dead to start with. We are done here */
+            MPI_Comm_free(&scomm);
+            *newcomm = comm;
+            return MPI_SUCCESS;
+        }
+        /* We handle failures during this function ourselves... */
+        MPI_Comm_set_errhandler( scomm, MPI_ERRORS_RETURN );
+
+        rc = MPI_Comm_spawn(gargv[0], &gargv[1], nd, MPI_INFO_NULL,
+                            0, scomm, &icomm, MPI_ERRCODES_IGNORE);
+        flag = (MPI_SUCCESS == rc);
+        MPIX_Comm_agree(scomm, &flag);
+        if( !flag ) {
+            if( MPI_SUCCESS == rc ) {
+                MPIX_Comm_revoke(icomm);
+                MPI_Comm_free(&icomm);
+            }
+            MPI_Comm_free(&scomm);
+            if( verbose ) fprintf(stderr, "%04d: comm_spawn failed, redo\n", rank);
+            goto redo;
+        }
+
+        /* remembering the former rank: we will reassign the same
+         * ranks in the new world. */
+        MPI_Comm_rank(comm, &crank);
+        MPI_Comm_rank(scomm, &srank);
+        /* the rank 0 in the scomm comm is going to determine the
+         * ranks at which the spares need to be inserted. */
+        if(0 == srank) {
+            /* getting the group of dead processes:
+             *   those in comm, but not in scomm are the deads */
+            MPI_Comm_group(comm, &cgrp);
+            MPI_Comm_group(scomm, &sgrp);
+            MPI_Group_difference(cgrp, sgrp, &dgrp);
+            /* Computing the rank assignment for the newly inserted spares */
+            for(i=0; i<nd; i++) {
+                MPI_Group_translate_ranks(dgrp, 1, &i, cgrp, &drank);
+                /* sending their new assignment to all new procs */
+                MPI_Send(&drank, 1, MPI_INT, i, 1, icomm);
+            }
+            MPI_Group_free(&cgrp); MPI_Group_free(&sgrp); MPI_Group_free(&dgrp);
+        }
+    }
+
+    /* Merge the intercomm, to reconstruct an intracomm (we check
+     * that this operation worked before we proceed further) */
+    rc = MPI_Intercomm_merge(icomm, 1, &mcomm);
+    rflag = flag = (MPI_SUCCESS==rc);
+    MPIX_Comm_agree(scomm, &flag);
+    if( MPI_COMM_WORLD != scomm ) MPI_Comm_free(&scomm);
+    MPIX_Comm_agree(icomm, &rflag);
+    MPI_Comm_free(&icomm);
+    if( !(flag && rflag) ) {
+        if( MPI_SUCCESS == rc ) {
+            MPI_Comm_free(&mcomm);
+        }
+        if( verbose ) fprintf(stderr, "%04d: Intercomm_merge failed, redo\n", rank);
+        goto redo;
+    }
+
+    /* Now, reorder mcomm according to original rank ordering in comm
+     * Split does the magic: removing spare processes and reordering ranks
+     * so that all surviving processes remain at their former place */
+    rc = MPI_Comm_split(mcomm, 1, crank, newcomm);
+
+    /* Split or some of the communications above may have failed if
+     * new failures have disrupted the process: we need to
+     * make sure we succeeded at all ranks, or retry until it works. */
+    flag = (MPI_SUCCESS==rc);
+    MPIX_Comm_agree(mcomm, &flag);
+    MPI_Comm_free(&mcomm);
+    if( !flag ) {
+        if( MPI_SUCCESS == rc ) {
+            MPI_Comm_free( newcomm );
+        }
+        if( verbose ) fprintf(stderr, "%04d: comm_split failed, redo\n", rank);
+        goto redo;
+    }
+
+    /* restore the error handler */
+    if( MPI_COMM_NULL != comm ) {
+        MPI_Errhandler errh;
+        MPI_Comm_get_errhandler( comm, &errh );
+        MPI_Comm_set_errhandler( *newcomm, errh );
+    }
+
+    return MPI_SUCCESS;
+}
